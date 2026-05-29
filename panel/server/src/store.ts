@@ -1,0 +1,249 @@
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
+import { dirname } from 'node:path';
+import { randomBytes, randomUUID } from 'node:crypto';
+import bcrypt from 'bcryptjs';
+
+export type Role = 'admin' | 'sub';
+
+export interface User {
+  id: string;
+  username: string;
+  role: Role;
+  passwordHash: string;
+  disabled: boolean;
+  createdAt: string;
+  // 该账户可访问的微信实例 id 列表。admin 隐式全部，忽略此字段。
+  allowedInstances: string[];
+}
+
+export interface Instance {
+  id: string; // 短 id，用于容器/卷命名
+  name: string; // 显示名
+  containerName: string; // woc-wx-<id>
+  volumeName: string; // woc-data-<id>
+  kasmUser: string; // 随机生成，服务端注入反代，永不下发前端
+  kasmPassword: string;
+  createdAt: string;
+  createdBy: string; // userId
+}
+
+interface Data {
+  users: User[];
+  instances: Instance[];
+}
+
+const FILE = process.env.PANEL_DATA || '/data/panel/accounts.json';
+
+let data: Data = { users: [], instances: [] };
+
+function persist() {
+  mkdirSync(dirname(FILE), { recursive: true });
+  const tmp = `${FILE}.tmp`;
+  writeFileSync(tmp, JSON.stringify(data, null, 2));
+  renameSync(tmp, FILE);
+}
+
+function makeUser(username: string, password: string, role: Role): User {
+  return {
+    id: randomUUID(),
+    username,
+    role,
+    passwordHash: bcrypt.hashSync(password, 10),
+    disabled: false,
+    createdAt: new Date().toISOString(),
+    allowedInstances: [],
+  };
+}
+
+export function initStore() {
+  if (existsSync(FILE)) {
+    data = JSON.parse(readFileSync(FILE, 'utf8'));
+  } else {
+    data = { users: [], instances: [] };
+  }
+  // 迁移：补齐新增字段，兼容旧账号文件
+  if (!Array.isArray(data.instances)) data.instances = [];
+  for (const u of data.users) {
+    if (!Array.isArray(u.allowedInstances)) u.allowedInstances = [];
+  }
+  if (!data.users.some((u) => u.role === 'admin')) {
+    const username = process.env.PANEL_ADMIN_USER || 'admin';
+    const password = process.env.PANEL_ADMIN_PASSWORD || 'wechat';
+    data.users.push(makeUser(username, password, 'admin'));
+    console.log(`[store] 已初始化管理员账号 '${username}'`);
+  }
+  persist();
+}
+
+// ---------- 用户 ----------
+export function publicUser(u: User) {
+  return {
+    id: u.id,
+    username: u.username,
+    role: u.role,
+    disabled: u.disabled,
+    createdAt: u.createdAt,
+    allowedInstances: u.role === 'admin' ? [] : u.allowedInstances,
+  };
+}
+
+export function findByUsername(username: string) {
+  return data.users.find((u) => u.username.toLowerCase() === username.toLowerCase());
+}
+
+export function findById(id: string) {
+  return data.users.find((u) => u.id === id);
+}
+
+export function listUsers() {
+  return data.users
+    .slice()
+    .sort((a, b) => (a.role === b.role ? a.createdAt.localeCompare(b.createdAt) : a.role === 'admin' ? -1 : 1))
+    .map(publicUser);
+}
+
+export function verifyPassword(u: User, password: string) {
+  return bcrypt.compareSync(password, u.passwordHash);
+}
+
+export function createSub(username: string, password: string, allowedInstances: string[] = []) {
+  if (findByUsername(username)) throw new Error('用户名已存在');
+  const u = makeUser(username, password, 'sub');
+  u.allowedInstances = sanitizeInstanceIds(allowedInstances);
+  data.users.push(u);
+  persist();
+  return publicUser(u);
+}
+
+export function setDisabled(id: string, disabled: boolean) {
+  const u = findById(id);
+  if (!u) throw new Error('用户不存在');
+  if (u.role === 'admin') throw new Error('不能禁用管理员');
+  u.disabled = disabled;
+  persist();
+  return publicUser(u);
+}
+
+export function resetPassword(id: string, password: string) {
+  const u = findById(id);
+  if (!u) throw new Error('用户不存在');
+  u.passwordHash = bcrypt.hashSync(password, 10);
+  persist();
+  return publicUser(u);
+}
+
+export function deleteUser(id: string) {
+  const u = findById(id);
+  if (!u) throw new Error('用户不存在');
+  if (u.role === 'admin') throw new Error('不能删除管理员');
+  data.users = data.users.filter((x) => x.id !== id);
+  persist();
+}
+
+// 设置某账户可访问的实例（账户侧编辑）
+export function setUserInstances(id: string, instanceIds: string[]) {
+  const u = findById(id);
+  if (!u) throw new Error('用户不存在');
+  if (u.role !== 'admin') u.allowedInstances = sanitizeInstanceIds(instanceIds);
+  persist();
+  return publicUser(u);
+}
+
+// ---------- 实例 ----------
+function sanitizeInstanceIds(ids: string[]): string[] {
+  const valid = new Set(data.instances.map((i) => i.id));
+  return [...new Set((ids || []).filter((x) => valid.has(x)))];
+}
+
+export function publicInstance(i: Instance) {
+  return { id: i.id, name: i.name, createdAt: i.createdAt, createdBy: i.createdBy };
+}
+
+export function listInstances() {
+  return data.instances.slice().sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+}
+
+export function findInstance(id: string) {
+  return data.instances.find((i) => i.id === id);
+}
+
+// 当前用户可见的实例（admin 全部，sub 按 allowedInstances）
+export function userInstances(u: User) {
+  if (u.role === 'admin') return listInstances();
+  const allowed = new Set(u.allowedInstances);
+  return listInstances().filter((i) => allowed.has(i.id));
+}
+
+export function userCanAccess(u: User, instanceId: string) {
+  if (u.role === 'admin') return !!findInstance(instanceId);
+  return u.allowedInstances.includes(instanceId) && !!findInstance(instanceId);
+}
+
+export function createInstance(name: string, createdBy: string, allowedUserIds: string[] = []) {
+  const id = randomBytes(5).toString('hex'); // 10 hex chars
+  const inst: Instance = {
+    id,
+    name: name.trim() || `微信-${id.slice(0, 4)}`,
+    containerName: `woc-wx-${id}`,
+    volumeName: `woc-data-${id}`,
+    kasmUser: 'woc',
+    // 用 hex（仅 0-9a-f）：容器内 init 脚本以 `openssl passwd -apr1 ${PASSWORD}` 未加引号方式生成 .htpasswd，
+    // base64url 可能含前导 '-' 而被 openssl 当作命令行选项，导致密码哈希为空、所有鉴权失败。hex 不含任何 shell 特殊字符。
+    kasmPassword: randomBytes(24).toString('hex'),
+    createdAt: new Date().toISOString(),
+    createdBy,
+  };
+  data.instances.push(inst);
+  // 把访问权限写到选中的账户上
+  for (const uid of allowedUserIds || []) {
+    const u = findById(uid);
+    if (u && u.role !== 'admin' && !u.allowedInstances.includes(id)) {
+      u.allowedInstances.push(id);
+    }
+  }
+  persist();
+  return inst;
+}
+
+export function removeInstance(id: string) {
+  const inst = findInstance(id);
+  if (!inst) throw new Error('实例不存在');
+  data.instances = data.instances.filter((i) => i.id !== id);
+  // 从所有账户的可访问列表里移除
+  for (const u of data.users) {
+    u.allowedInstances = u.allowedInstances.filter((x) => x !== id);
+  }
+  persist();
+  return inst;
+}
+
+// 设置某实例可被哪些账户访问（实例侧编辑）
+export function setInstanceUsers(id: string, userIds: string[]) {
+  const inst = findInstance(id);
+  if (!inst) throw new Error('实例不存在');
+  const allow = new Set(userIds || []);
+  for (const u of data.users) {
+    if (u.role === 'admin') continue;
+    const has = u.allowedInstances.includes(id);
+    if (allow.has(u.id) && !has) u.allowedInstances.push(id);
+    if (!allow.has(u.id) && has) u.allowedInstances = u.allowedInstances.filter((x) => x !== id);
+  }
+  persist();
+  return inst;
+}
+
+// 已登记一个实例（迁移用：复用旧 ./data 卷）。返回是否新建。
+export function registerExistingInstance(opts: {
+  name: string;
+  containerName: string;
+  volumeName: string;
+  kasmUser: string;
+  kasmPassword: string;
+  createdBy: string;
+}) {
+  const id = randomBytes(5).toString('hex');
+  const inst: Instance = { id, createdAt: new Date().toISOString(), ...opts };
+  data.instances.push(inst);
+  persist();
+  return inst;
+}

@@ -1,25 +1,32 @@
 #!/bin/bash
-# 由 KasmVNC base 的 openbox 会话在桌面就绪后执行。
-# 定位微信可执行文件并常驻拉起：用户在 web 端关掉窗口后会自动重开，避免黑屏。
+# 由 KasmVNC base 的 openbox 会话在桌面就绪后执行（以 app 用户身份）。
+# 微信本体由面板经 docker exec 触发下载/解压到数据卷 /config/wechat（见 wechat-ctl.sh），
+# 本脚本只负责：等待微信就绪 + 常驻拉起（关窗自动重开；更新后从新版本路径重启）。
 
 set -u
 
-# 官方 deb 安装到 /opt/wechat/wechat；同时兜底查 PATH
-if [ -x /opt/wechat/wechat ]; then
-    WECHAT_BIN=/opt/wechat/wechat
-else
-    WECHAT_BIN="$(command -v wechat || true)"
-fi
-
-if [ -z "${WECHAT_BIN}" ]; then
-    echo "[autostart] 未找到微信可执行文件，请检查 deb 是否安装成功" >&2
-    exit 1
-fi
+WECHAT_BIN=/config/wechat/opt/wechat/wechat
 
 # 容器内无 GPU，强制软件渲染
 export LIBGL_ALWAYS_SOFTWARE=1
 
+# 1) 等待微信安装就绪（首次需在面板点「下载并安装」）
+notified=0
+while [ ! -x "${WECHAT_BIN}" ]; do
+    if [ "${notified}" -eq 0 ]; then
+        echo "[autostart] 微信尚未安装，等待面板触发下载…（首次使用请在面板点「下载并安装微信」）"
+        notified=1
+    fi
+    sleep 2
+done
+
+# 3) 常驻拉起微信
 while true; do
+    if [ ! -x "${WECHAT_BIN}" ]; then
+        # 更新过程中本体被临时挪走，等就位再继续
+        sleep 2
+        continue
+    fi
     echo "[autostart] 启动微信: ${WECHAT_BIN}"
     "${WECHAT_BIN}"
     echo "[autostart] 微信已退出，2 秒后重启"

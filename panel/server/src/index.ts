@@ -1,0 +1,408 @@
+import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
+import cookie from '@fastify/cookie';
+import fstatic from '@fastify/static';
+import httpProxy from 'http-proxy';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import type { IncomingMessage } from 'node:http';
+import type { Socket } from 'node:net';
+import {
+  initStore,
+  findByUsername,
+  findById,
+  verifyPassword,
+  publicUser,
+  listUsers,
+  createSub,
+  setDisabled,
+  resetPassword,
+  deleteUser,
+  setUserInstances,
+  listInstances,
+  findInstance,
+  userInstances,
+  userCanAccess,
+  createInstance,
+  removeInstance as removeInstanceRecord,
+  setInstanceUsers,
+  publicInstance,
+  type User,
+  type Instance,
+} from './store.js';
+import {
+  ensureNetwork,
+  ensureRunning,
+  runInstance,
+  removeInstance as removeInstanceContainer,
+  instanceRuntime,
+  triggerWechat,
+  wechatStatus,
+  instanceTarget,
+} from './docker.js';
+import { createSession, getSession, destroySession, destroyUserSessions } from './sessions.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+const PORT = Number(process.env.PORT || 8080);
+const HOST = process.env.HOST || '0.0.0.0';
+const STATIC_DIR = process.env.STATIC_DIR || join(__dirname, '../../web/dist');
+const COOKIE = 'woc_sess';
+
+function basicAuth(inst: Instance) {
+  return 'Basic ' + Buffer.from(`${inst.kasmUser}:${inst.kasmPassword}`).toString('base64');
+}
+
+initStore();
+
+const app = Fastify({ logger: true, trustProxy: true });
+await app.register(cookie);
+
+// ---------- 鉴权辅助 ----------
+function currentUser(req: FastifyRequest): User | null {
+  const token = req.cookies?.[COOKIE];
+  const s = getSession(token);
+  if (!s) return null;
+  const u = findById(s.userId);
+  if (!u || u.disabled) return null;
+  return u;
+}
+
+function requireAuth(req: FastifyRequest, reply: FastifyReply): User | null {
+  const u = currentUser(req);
+  if (!u) {
+    reply.code(401).send({ error: '未登录' });
+    return null;
+  }
+  return u;
+}
+
+function requireAdmin(req: FastifyRequest, reply: FastifyReply): User | null {
+  const u = requireAuth(req, reply);
+  if (!u) return null;
+  if (u.role !== 'admin') {
+    reply.code(403).send({ error: '需要管理员权限' });
+    return null;
+  }
+  return u;
+}
+
+// ---------- 登录 / 会话 ----------
+app.post('/api/auth/login', async (req, reply) => {
+  const { username, password } = (req.body as any) ?? {};
+  const u = username ? findByUsername(username) : undefined;
+  if (!u || u.disabled || !verifyPassword(u, password ?? '')) {
+    return reply.code(401).send({ error: '用户名或密码错误' });
+  }
+  const token = createSession(u.id);
+  reply.setCookie(COOKIE, token, {
+    httpOnly: true,
+    sameSite: 'lax',
+    path: '/',
+    maxAge: 60 * 60 * 12,
+  });
+  return { user: publicUser(u) };
+});
+
+app.post('/api/auth/logout', async (req, reply) => {
+  destroySession(req.cookies?.[COOKIE]);
+  reply.clearCookie(COOKIE, { path: '/' });
+  return { ok: true };
+});
+
+app.get('/api/auth/me', async (req, reply) => {
+  const u = currentUser(req);
+  if (!u) return reply.code(401).send({ error: '未登录' });
+  return { user: publicUser(u) };
+});
+
+// ---------- 自助改密 ----------
+app.post('/api/account/password', async (req, reply) => {
+  const u = requireAuth(req, reply);
+  if (!u) return;
+  const { oldPassword, newPassword } = (req.body as any) ?? {};
+  if (!verifyPassword(u, oldPassword ?? '')) return reply.code(400).send({ error: '原密码错误' });
+  if (!newPassword || String(newPassword).length < 6) return reply.code(400).send({ error: '新密码至少 6 位' });
+  resetPassword(u.id, newPassword);
+  return { ok: true };
+});
+
+// ---------- 管理员：子账号管理 ----------
+app.get('/api/admin/users', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  return { users: listUsers() };
+});
+
+app.post('/api/admin/users', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const { username, password } = (req.body as any) ?? {};
+  if (!username || !/^[a-zA-Z0-9_]{3,20}$/.test(username)) {
+    return reply.code(400).send({ error: '用户名为 3-20 位字母、数字或下划线' });
+  }
+  if (!password || String(password).length < 6) return reply.code(400).send({ error: '密码至少 6 位' });
+  const allowedInstances = Array.isArray((req.body as any)?.allowedInstances) ? (req.body as any).allowedInstances : [];
+  try {
+    return { user: createSub(username, password, allowedInstances) };
+  } catch (e: any) {
+    return reply.code(400).send({ error: e.message });
+  }
+});
+
+// 账户侧：设置某账户可访问的实例
+app.post('/api/admin/users/:id/instances', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const id = (req.params as any).id;
+  const instanceIds = Array.isArray((req.body as any)?.instanceIds) ? (req.body as any).instanceIds : [];
+  try {
+    return { user: setUserInstances(id, instanceIds) };
+  } catch (e: any) {
+    return reply.code(400).send({ error: e.message });
+  }
+});
+
+app.post('/api/admin/users/:id/disable', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const { disabled } = (req.body as any) ?? {};
+  const id = (req.params as any).id;
+  try {
+    const user = setDisabled(id, !!disabled);
+    if (disabled) destroyUserSessions(id);
+    return { user };
+  } catch (e: any) {
+    return reply.code(400).send({ error: e.message });
+  }
+});
+
+app.post('/api/admin/users/:id/reset', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const { newPassword } = (req.body as any) ?? {};
+  const id = (req.params as any).id;
+  if (!newPassword || String(newPassword).length < 6) return reply.code(400).send({ error: '密码至少 6 位' });
+  try {
+    const user = resetPassword(id, newPassword);
+    destroyUserSessions(id);
+    return { user };
+  } catch (e: any) {
+    return reply.code(400).send({ error: e.message });
+  }
+});
+
+app.delete('/api/admin/users/:id', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const id = (req.params as any).id;
+  try {
+    deleteUser(id);
+    destroyUserSessions(id);
+    return { ok: true };
+  } catch (e: any) {
+    return reply.code(400).send({ error: e.message });
+  }
+});
+
+// ---------- 微信实例管理 ----------
+// 列出当前用户可见实例（含运行态 + 微信安装状态）
+app.get('/api/instances', async (req, reply) => {
+  const u = requireAuth(req, reply);
+  if (!u) return;
+  const visible = userInstances(u);
+  const out = await Promise.all(
+    visible.map(async (pub) => {
+      const inst = findInstance(pub.id)!;
+      const [runtime, wx] = await Promise.all([instanceRuntime(inst), wechatStatus(inst)]);
+      return { ...pub, runtime, wechat: wx };
+    }),
+  );
+  return { instances: out };
+});
+
+// 新建实例（仅管理员）：生成凭据 + docker run + 分配访问账户
+app.post('/api/admin/instances', async (req, reply) => {
+  const admin = requireAdmin(req, reply);
+  if (!admin) return;
+  const { name } = (req.body as any) ?? {};
+  const allowedUserIds = Array.isArray((req.body as any)?.allowedUserIds) ? (req.body as any).allowedUserIds : [];
+  if (!name || String(name).trim().length === 0 || String(name).length > 30) {
+    return reply.code(400).send({ error: '实例名称为 1-30 个字符' });
+  }
+  const inst = createInstance(String(name), admin.id, allowedUserIds);
+  try {
+    await runInstance(inst);
+  } catch (e: any) {
+    removeInstanceRecord(inst.id); // 容器起不来则回滚登记
+    return reply.code(500).send({ error: '创建容器失败：' + (e?.message || e) });
+  }
+  return { instance: publicInstance(inst) };
+});
+
+// 删除实例（仅管理员）：默认保留数据卷，?purge=1 才永久删聊天记录
+app.delete('/api/admin/instances/:id', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const id = (req.params as any).id;
+  const purge = (req.query as any)?.purge === '1' || (req.query as any)?.purge === 'true';
+  const inst = findInstance(id);
+  if (!inst) return reply.code(404).send({ error: '实例不存在' });
+  await removeInstanceContainer(inst, purge);
+  removeInstanceRecord(id);
+  return { ok: true };
+});
+
+// 实例侧：设置该实例可被哪些账户访问
+app.post('/api/admin/instances/:id/users', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const id = (req.params as any).id;
+  const userIds = Array.isArray((req.body as any)?.userIds) ? (req.body as any).userIds : [];
+  try {
+    setInstanceUsers(id, userIds);
+    return { ok: true };
+  } catch (e: any) {
+    return reply.code(400).send({ error: e.message });
+  }
+});
+
+// 该实例的微信安装状态（有访问权限即可看）
+app.get('/api/instances/:id/wechat/status', async (req, reply) => {
+  const u = requireAuth(req, reply);
+  if (!u) return;
+  const id = (req.params as any).id;
+  if (!userCanAccess(u, id)) return reply.code(403).send({ error: '无权访问该实例' });
+  return { status: await wechatStatus(findInstance(id)!) };
+});
+
+// 触发该实例微信下载/更新（仅管理员）
+async function triggerInstanceWechat(id: string, cmd: 'install' | 'update', reply: FastifyReply) {
+  const inst = findInstance(id);
+  if (!inst) return reply.code(404).send({ error: '实例不存在' });
+  try {
+    await triggerWechat(inst, cmd);
+    return { ok: true };
+  } catch (e: any) {
+    return reply.code(500).send({ error: '无法触发安装：' + (e?.message || e) });
+  }
+}
+
+app.post('/api/admin/instances/:id/wechat/install', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  return triggerInstanceWechat((req.params as any).id, 'install', reply);
+});
+
+app.post('/api/admin/instances/:id/wechat/update', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  return triggerInstanceWechat((req.params as any).id, 'update', reply);
+});
+
+// ---------- 反向代理到内网 KasmVNC（按实例注入 Basic auth，会话 + 权限把守） ----------
+// 单个 proxy 实例，target 与凭据逐请求指定：凭据暂存在 req 上，proxyReq 时注入。
+const proxy = httpProxy.createProxyServer({ changeOrigin: true, ws: true });
+proxy.on('proxyReq', (proxyReq, req) => {
+  const auth = (req as any)._wocAuth;
+  if (auth) proxyReq.setHeader('authorization', auth);
+});
+proxy.on('proxyReqWs', (proxyReq, req) => {
+  const auth = (req as any)._wocAuth;
+  if (auth) proxyReq.setHeader('authorization', auth);
+});
+// 兜底：剥掉 KasmVNC 401 的 WWW-Authenticate 头，避免浏览器弹出原生 Basic Auth 登录框。
+// 正常路径下我们已注入正确凭据（不会 401）；万一凭据失配，宁可桌面加载失败也绝不把登录弹窗暴露给用户。
+proxy.on('proxyRes', (proxyRes) => {
+  delete proxyRes.headers['www-authenticate'];
+});
+proxy.on('error', (_err, _req, res) => {
+  try {
+    const r = res as any;
+    if (r && typeof r.writeHead === 'function') {
+      r.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
+      r.end('桌面服务暂时不可用');
+    } else if (r && typeof r.destroy === 'function') {
+      r.destroy();
+    }
+  } catch {
+    /* ignore */
+  }
+});
+
+// /desktop/:id/rest → rest（剥掉前缀与实例段）。返回 null 表示 url 非法。
+function parseDesktopUrl(rawUrl: string): { id: string; rest: string } | null {
+  const m = rawUrl.match(/^\/desktop\/([0-9a-f]{6,})(\/.*|\?.*|)?$/);
+  if (!m) return null;
+  const id = m[1];
+  let rest = m[2] || '/';
+  if (rest.startsWith('?')) rest = '/' + rest;
+  if (rest === '') rest = '/';
+  return { id, rest };
+}
+
+const desktopHandler = (req: FastifyRequest, reply: FastifyReply) => {
+  const u = currentUser(req);
+  if (!u) {
+    reply.code(302).header('location', '/login').send();
+    return;
+  }
+  const parsed = parseDesktopUrl(req.raw.url || '');
+  if (!parsed || !userCanAccess(u, parsed.id)) {
+    reply.code(403).send({ error: '无权访问该实例' });
+    return;
+  }
+  const inst = findInstance(parsed.id)!;
+  reply.hijack();
+  req.raw.url = parsed.rest;
+  (req.raw as any)._wocAuth = basicAuth(inst);
+  proxy.web(req.raw, reply.raw, { target: instanceTarget(inst) });
+};
+
+app.all('/desktop/:id', desktopHandler);
+app.all('/desktop/:id/*', desktopHandler);
+
+// ---------- 静态 SPA + 前端路由回退 ----------
+await app.register(fstatic, { root: STATIC_DIR, wildcard: false, index: ['index.html'] });
+app.setNotFoundHandler((req, reply) => {
+  const url = req.raw.url || '';
+  if (url.startsWith('/api') || url.startsWith('/desktop')) {
+    return reply.code(404).send({ error: 'not found' });
+  }
+  return reply.sendFile('index.html');
+});
+
+// ---------- 启动 + WebSocket 升级（同样校验会话） ----------
+function parseCookies(header?: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!header) return out;
+  for (const part of header.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx === -1) continue;
+    out[part.slice(0, idx).trim()] = decodeURIComponent(part.slice(idx + 1).trim());
+  }
+  return out;
+}
+
+await app.ready();
+
+app.server.on('upgrade', (req: IncomingMessage, socket: Socket, head: Buffer) => {
+  const parsed = req.url ? parseDesktopUrl(req.url) : null;
+  if (!parsed) {
+    socket.destroy();
+    return;
+  }
+  const cookies = parseCookies(req.headers.cookie);
+  const s = getSession(cookies[COOKIE]);
+  const u = s && findById(s.userId);
+  if (!u || u.disabled || !userCanAccess(u, parsed.id)) {
+    socket.destroy();
+    return;
+  }
+  const inst = findInstance(parsed.id)!;
+  req.url = parsed.rest;
+  (req as any)._wocAuth = basicAuth(inst);
+  proxy.ws(req, socket, head, { target: instanceTarget(inst) });
+});
+
+// 探测面板网络 + 重启后把已登记实例的容器拉起来
+await ensureNetwork().catch(() => {});
+for (const pub of listInstances()) {
+  try {
+    await ensureRunning(findInstance(pub.id)!);
+  } catch (e: any) {
+    app.log.warn(`[instance] 启动实例 ${pub.id} 失败: ${e?.message || e}`);
+  }
+}
+
+await app.listen({ port: PORT, host: HOST });
+console.log(`[panel] 监听 http://${HOST}:${PORT}  （多实例反代已就绪）`);

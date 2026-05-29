@@ -3,41 +3,24 @@
 # 自带 Xvfb + openbox + KasmVNC + web 客户端(3000/3001)
 FROM lscr.io/linuxserver/baseimage-kasmvnc:debianbookworm
 
-# TARGETARCH 由 Docker BuildKit 自动注入：本机构建=本机架构，
-# 因此在 x86 NAS / arm NAS / Apple Silicon Mac 上 `docker compose build` 都会自动选对包。
-ARG TARGETARCH
-# CDN 主链失败时回退备链
-ARG WECHAT_CDN="https://dldir1v6.qq.com/weixin/Universal/Linux"
-ARG WECHAT_CDN_FALLBACK="https://dldir1.qq.com/weixin/Universal/Linux"
-
+# 微信本体不再在构建时下载/安装，改为运行时由面板点击下载、解压到数据卷 /config
+#（见 wechat-ctl.sh）。构建时只装：中文字体、语言环境、下载工具，以及微信运行所
+# 需的全部系统库（这些需 root/apt，必须 bake 进镜像）。
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN set -eux; \
-    # 1) 按架构映射微信 deb 文件名
-    case "${TARGETARCH}" in \
-        amd64) WECHAT_FILE="WeChatLinux_x86_64.deb" ;; \
-        arm64) WECHAT_FILE="WeChatLinux_arm64.deb" ;; \
-        *) echo "不支持的架构: ${TARGETARCH}（微信仅提供 x86_64 / arm64）" >&2; exit 1 ;; \
-    esac; \
-    echo "构建架构=${TARGETARCH}, 微信包=${WECHAT_FILE}"; \
-    # 2) 依赖：中文字体（否则界面/消息显示方块）+ 语言环境 + 下载工具
+    # 中文字体（否则界面/消息显示方块）+ 语言环境 + 下载/解压工具
     apt-get update; \
     apt-get install -y --no-install-recommends \
-        curl ca-certificates locales \
+        curl ca-certificates locales dpkg \
         fonts-wqy-zenhei fonts-wqy-microhei fonts-noto-cjk fonts-noto-color-emoji \
         libnss3 libgbm1 libasound2 libxss1; \
     sed -i 's/# zh_CN.UTF-8 UTF-8/zh_CN.UTF-8 UTF-8/' /etc/locale.gen; \
     locale-gen; \
-    # 3) 下载微信 deb（主链失败回退备链）
-    ( curl -fSL --retry 3 -A "Mozilla/5.0" -o /tmp/wechat.deb "${WECHAT_CDN}/${WECHAT_FILE}" \
-      || curl -fSL --retry 3 -A "Mozilla/5.0" -o /tmp/wechat.deb "${WECHAT_CDN_FALLBACK}/${WECHAT_FILE}" ); \
-    # 4) 用 apt 安装本地 deb 以自动解决依赖
-    apt-get install -y --no-install-recommends /tmp/wechat.deb; \
-    rm -f /tmp/wechat.deb; \
     apt-get clean; \
     rm -rf /var/lib/apt/lists/*
 
-# 微信 deb 未声明、但运行时需要的额外库（单独成层，避免动到上面缓存的下载层）。
+# 微信运行时需要、但官方 deb 未声明的额外库（单独成层，避免动到上面缓存的安装层）。
 # 微信原生版是 Qt 程序，依赖一组 xcb 平台库；libxcb-cursor0 由 Qt 动态 dlopen，ldd 查不到，需主动装。
 RUN set -eux; \
     apt-get update; \
@@ -70,7 +53,26 @@ ENV LANG=zh_CN.UTF-8 \
     LC_ALL=zh_CN.UTF-8 \
     LIBGL_ALWAYS_SOFTWARE=1
 
-# openbox 会话启动时执行此脚本拉起微信
+# 让 KasmVNC web 客户端默认开启 IME 输入模式：
+# 用户用本地（客户端）输入法打中文，拼音联想在本地完成、只把成品汉字发进容器，无需容器内装 IME。
+# 默认值仅在浏览器未存过该设置时生效，不会覆盖用户手动改过的偏好。
+# 注意：实际加载的是 webpack 产物 dist/main.bundle.js（app/ui.js 是未打包源码、运行时不加载），故必须改 bundle。
+# 末尾的 grep 作为断言：若 base 镜像换了打包结构、改不到任何文件，则构建直接失败而非静默放过。
+RUN set -eux; \
+    patched=0; \
+    for f in /usr/share/kasmvnc/www/dist/*.bundle.js /usr/local/share/kasmvnc/www/dist/*.bundle.js; do \
+        if [ -f "$f" ] && grep -q "initSetting('enable_ime', false)" "$f"; then \
+            sed -i "s/initSetting('enable_ime', false)/initSetting('enable_ime', true)/g" "$f"; \
+            patched=1; \
+        fi; \
+    done; \
+    [ "$patched" = "1" ]
+
+# 微信下载/解压控制脚本（运行时由面板经 docker exec 触发，状态写入数据卷 /config/.woc-state）
+COPY wechat-ctl.sh /woc/wechat-ctl.sh
+RUN chmod +x /woc/wechat-ctl.sh
+
+# openbox 会话启动时执行此脚本：等待微信就绪 + 常驻拉起微信
 COPY autostart /defaults/autostart
 RUN chmod +x /defaults/autostart
 

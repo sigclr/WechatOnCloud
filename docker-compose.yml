@@ -1,35 +1,35 @@
+# WechatOnCloud —— 面板为唯一服务；微信实例由面板按需动态创建（docker run）。
+# 面板挂载 docker.sock 来创建/启动/删除微信实例容器，并反向代理到它们的 KasmVNC。
+# 镜像全部从 GHCR 拉取，无需本地构建。要改配置：复制 .env.example 为 .env 后修改。
 services:
-  wechat:
-    build:
-      context: ./docker
-      dockerfile: Dockerfile
-      # 不指定 platform：BuildKit 默认按本机架构构建并自动下载对应微信包。
-      # 仅当需要在 A 架构机器上为 B 架构 NAS 交叉构建时，才取消下一行注释并改成目标架构。
-      # platforms: ["linux/arm64"]
-    image: wechat-on-cloud:latest
-    container_name: wechat-on-cloud
+  panel:
+    image: ghcr.io/gloridust/woc-panel:${WOC_VERSION:-latest}
+    container_name: woc-panel
+    # pull_policy 用默认（missing）：本地已有同名镜像就直接用，没有才去 GHCR 拉。
+    # 这样「发布前本地自构建」与「线上拉取」都能用同一份 compose。
+    # 想强制更新到 GHCR 最新版：docker compose pull && docker compose up -d
 
-    # 以下全部可不填：缺省值开箱即用。要改只需复制 .env.example 为 .env 后修改。
     environment:
+      - PORT=8080
+      # 新建微信实例时使用的镜像（多架构，amd64/arm64 自动匹配）
+      - WOC_WECHAT_IMAGE=ghcr.io/gloridust/wechat-on-cloud:${WOC_VERSION:-latest}
+      # 透传给每个微信实例容器（KasmVNC 基础镜像用它们降权运行）
       - PUID=${WOC_PUID:-1000}
       - PGID=${WOC_PGID:-1000}
       - TZ=${WOC_TZ:-Asia/Shanghai}
-      # KasmVNC 内置 web 端基础鉴权（MVP 阶段最低限度访问控制）
-      - CUSTOM_USER=${WOC_USER:-admin}
-      - PASSWORD=${WOC_PASSWORD:-wechat}
+      # 面板首个管理员账号（仅首次启动、无账号文件时写入；务必改掉默认密码）
+      - PANEL_ADMIN_USER=${WOC_USER:-admin}
+      - PANEL_ADMIN_PASSWORD=${WOC_PASSWORD:-wechat}
+      - PANEL_DATA=/data/accounts.json
 
     volumes:
-      # 持久化登录态与消息：微信数据写在容器内 HOME=/config 下
-      - ./data:/config
+      # 面板账号数据（用户、实例元信息、密码哈希）
+      - ./data-panel:/data
+      # 面板经 docker 引擎创建/启动/删除微信实例容器、exec 触发下载、读取进度。
+      # 注意：docker.sock 等同宿主 root 权限，故实例增删仅限管理员，docker API 绝不暴露给前端。
+      - /var/run/docker.sock:/var/run/docker.sock
 
     ports:
-      - "${WOC_HTTP_PORT:-36080}:3000"    # HTTP  web 客户端（宿主用冷门端口避免冲突）
-      - "${WOC_HTTPS_PORT:-36443}:3001"   # HTTPS web 客户端（自签证书）
-
-    # 微信内部沙箱需要，否则可能起不来
-    security_opt:
-      - seccomp:unconfined
-    # 微信/Chromium 系共享内存，过小会崩
-    shm_size: "1gb"
+      - "${WOC_HTTP_PORT:-36080}:8080"   # 面板 = 唯一对外入口
 
     restart: unless-stopped
