@@ -10,8 +10,8 @@ WECHAT_BIN=/config/wechat/opt/wechat/wechat
 # 容器内无 GPU，强制软件渲染
 export LIBGL_ALWAYS_SOFTWARE=1
 
-# 防“最小化后丢失”：本桌面（openbox）无任务栏，微信被最小化就无处恢复 → 黑屏。
-# 看守进程：每 2s 把“被最小化（不可见）”的顶层窗口重新激活，相当于禁用最小化。
+# 防"最小化后丢失"：本桌面（openbox）无任务栏，微信被最小化就无处恢复 → 黑屏。
+# 看守进程：每 2s 把"被最小化（不可见）"的顶层窗口重新激活，相当于禁用最小化。
 (
     export DISPLAY="${DISPLAY:-:1}"
     while sleep 2; do
@@ -20,6 +20,15 @@ export LIBGL_ALWAYS_SOFTWARE=1
         for w in ${all}; do
             printf '%s\n' "${vis}" | grep -qx "${w}" || xdotool windowactivate "${w}" 2>/dev/null || true
         done
+    done
+) &
+
+# 修复 KasmVNC IME Bug (linuxserver#79): 输入一定量不重复中文字符后 xkbcomp 状态累积溢出，
+# 导致新增字符被忽略。每 10s 刷新键盘映射可重置内部状态。
+(
+    export DISPLAY="${DISPLAY:-:1}"
+    while sleep 10; do
+        setxkbmap us 2>/dev/null || true
     done
 ) &
 
